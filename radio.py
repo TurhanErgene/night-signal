@@ -41,15 +41,15 @@ RETRY_DELAYS = (2, 4, 8, 16, 30)
 STABLE_STREAM_TIME = 10
 ESC = "\x1b["
 GITHUB_REPO = "github.com/TurhanErgene/night-signal"
-HEADER_INTERVAL = 6
+HEADER_COLUMNS_PER_SECOND = 8
 TONE = (
     "aevalsrc=exprs='0.12*(sin(2*PI*110*t)+0.5*sin(2*PI*165*t))"
     "*pow(0.55+0.45*sin(2*PI*1.2*t),2)':sample_rate=44100"
 )
 PALETTES = {
-    "Classic": {"text": "1;97", "active": "1;92", "accent": "95", "dim": "90", "warning": "93"},
-    "Amber": {"text": "1;97", "active": "1;93", "accent": "33", "dim": "90", "warning": "91"},
-    "Chromatic": {"text": "97", "active": "1;96", "accent": "1;95", "dim": "90", "warning": "93"},
+    "Classic": {"text": "1;97", "active": "1;92", "accent": "95", "dim": "90", "warning": "93", "star": "1;93"},
+    "Amber": {"text": "1;97", "active": "1;93", "accent": "33", "dim": "90", "warning": "91", "star": "1;93"},
+    "Chromatic": {"text": "97", "active": "1;96", "accent": "1;95", "dim": "90", "warning": "93", "star": "1;93"},
     "Mono": {},
 }
 SPECTRUM_COLORS = (
@@ -103,7 +103,11 @@ def local_sources(paths):
 
 def copy_to_clipboard(value, success):
     if os.name == "nt":
-        commands, encoding = (("clip.exe",),), "utf-16"
+        # Write Unicode text without a BOM or trailing newline for Explorer.
+        commands = (("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                     "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); "
+                     "Set-Clipboard -Value ([Console]::In.ReadToEnd()) -ErrorAction Stop"),)
+        encoding = "utf-8"
     elif sys.platform == "darwin":
         commands, encoding = (("pbcopy",),), "utf-8"
     else:
@@ -124,6 +128,20 @@ def copy_to_clipboard(value, success):
     if sys.platform.startswith("linux"):
         return "Clipboard unavailable. Try wl-copy or xclip."
     return "Clipboard unavailable."
+
+
+def open_music_folder():
+    try:
+        MUSIC.mkdir(exist_ok=True)
+        if os.name == "nt":
+            os.startfile(str(MUSIC))
+        else:
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.Popen([opener, str(MUSIC)], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return "Could not open the folder. Press C to copy its path."
+    return "Opening the music folder. Press L to scan again."
 
 
 def plain(value):
@@ -620,6 +638,8 @@ class Radio:
                 self.music_help = ""
             elif key == "c":
                 self.music_note = copy_to_clipboard(str(MUSIC), "Music folder path copied.")
+            elif key == "o":
+                self.music_note = open_music_folder()
             elif key == "l":
                 self.toggle_local()
         elif key == "h":
@@ -641,13 +661,17 @@ class Radio:
             self.fullscreen = False
         elif key == "l":
             self.toggle_local()
+        elif key == "o":
+            self.music_help = "Music folder:"
+            self.music_note = open_music_folder()
         elif self.local_index is not None and key in ("up", "left", "k", "p", "down", "right", "j", "n"):
             direction = -1 if key in ("up", "left", "k", "p") else 1
             self.select_local((self.local_index + direction) % len(self.local_tracks))
         elif key in ("up", "left", "k", "down", "right", "j"):
             presets = self.preset_indices()
-            direction = -1 if key in ("up", "left", "k") else 1
-            self.selected = presets[(presets.index(self.selected) + direction) % len(presets)]
+            if presets:
+                direction = -1 if key in ("up", "left", "k") else 1
+                self.selected = presets[(presets.index(self.selected) + direction) % len(presets)]
         elif len(key) == 1 and key in "123456789" and int(key) <= len(self.stations):
             self.selected = int(key) - 1
             if self.selected not in self.preset_indices():
@@ -655,13 +679,15 @@ class Radio:
             self.tune()
         elif key in ("\r", "\n"):
             if self.local_index is None:
-                self.tune()
+                if self.preset_indices():
+                    self.tune()
             else:
                 self.select_local(self.local_index)
         elif key == " ":
             if self.playback is None and self.retry_at is None:
                 if self.local_index is None:
-                    self.tune()
+                    if self.preset_indices():
+                        self.tune()
                 else:
                     self.start_playback()
             else:
@@ -669,7 +695,7 @@ class Radio:
         elif key == "v":
             self.show_spectrum = not self.show_spectrum
             self.save()
-        elif key == "f" and self.local_index is None:
+        elif key == "f" and self.local_index is None and self.preset_indices():
             url = self.stations[self.selected].url
             if url in self.favorites:
                 self.favorites.remove(url)
@@ -678,6 +704,7 @@ class Radio:
             self.keep_preset_visible()
             self.save()
         elif key == "\t" and self.local_index is None:
+            self.fullscreen = False
             self.favorites_only = not self.favorites_only
             self.keep_preset_visible()
         elif key in ("+", "=", "-", "m"):
@@ -693,9 +720,7 @@ class Radio:
 
     def keep_preset_visible(self):
         presets = self.preset_indices()
-        if not presets:
-            self.favorites_only = False
-        elif self.selected not in presets:
+        if presets and self.selected not in presets:
             self.selected = presets[0]
 
 
@@ -747,6 +772,13 @@ def dial(count, active, width):
     return "".join(labels), "".join(ticks)
 
 
+def header_offset(elapsed, space):
+    if space <= 0:
+        return 0
+    step = int(max(0, elapsed) * HEADER_COLUMNS_PER_SECOND) % (2 * space)
+    return min(step, 2 * space - step)
+
+
 def screen(radio, columns, rows, now=None):
     columns -= 1
     if not radio.fullscreen:
@@ -793,7 +825,8 @@ def screen(radio, columns, rows, now=None):
             *(row(part) for part in parts[:visible]),
             *([row("...  Press C for the full path.")] if len(parts) > visible else []),
             row(radio.music_note, "accent"),
-            row("C Copy path | L Scan again | ESC Back", "dim"),
+            row("O Open | C Copy | L Scan | ESC Back", "dim"),
+            row("Paste into the file manager's address bar.", "dim"),
             rule,
         ])
 
@@ -866,19 +899,23 @@ def screen(radio, columns, rows, now=None):
             rule,
         ])
 
-    star_text = f"* Star: {GITHUB_REPO}"
-    star_link = f"\x1b]8;;https://{GITHUB_REPO}\x1b\\{star_text}\x1b]8;;\x1b\\"
-    header = [
-        row(split("N I G H T   S I G N A L", f"[ {radio.status} ]"), status_color),
-        framed(paint(star_link, "accent") + " " * (inner - len(star_text))),
-    ]
+    title = "N I G H T   S I G N A L"
+    status = f"[ {radio.status} ]"
+    if inner < 54 and radio.status == "WAITING TO RETRY":
+        status = "[ RETRY WAIT ]"
+    star_text = f"{' ' if inner < 54 else ' Star: '}{GITHUB_REPO}"
+    star_label = paint("*", "star") + paint(star_text, "accent")
+    star_link = f"\x1b]8;;https://{GITHUB_REPO}\x1b\\{star_label}\x1b]8;;\x1b\\"
     now = time.monotonic() if now is None else now
-    if radio.header_motion and int((now - radio.header_started) / HEADER_INTERVAL) % 2:
-        header.reverse()
+    elapsed = now - radio.header_started if radio.header_motion else 0
+    title_left = header_offset(elapsed, inner - len(status) - 1 - len(title))
+    star_space = inner - 1 - len(star_text)
+    star_left = header_offset(elapsed, star_space)
 
     lines = [
         rule,
-        *header,
+        row(split(" " * title_left + title, status), status_color),
+        framed(" " * star_left + star_link + " " * (star_space - star_left)),
         row(labels, "dim"),
         row(ticks, "accent"),
         row(split(station.name, station.genre)),
@@ -891,7 +928,7 @@ def screen(radio, columns, rows, now=None):
     presets = list(range(len(radio.local_tracks))) if local else radio.preset_indices()
     visible = min(len(presets), rows - height - 15)
     selected = radio.local_index if local else radio.selected
-    focus = presets.index(selected)
+    focus = presets.index(selected) if presets else 0
     start = min(max(0, focus - visible + 1), len(presets) - visible)
     for index in presets[start:start + visible]:
         preset = radio.local_tracks[index] if local else radio.stations[index]
@@ -902,17 +939,19 @@ def screen(radio, columns, rows, now=None):
         if not local:
             text = split(text, preset.genre)
         lines.append(row(text, "active" if cursor == ">" else "text"))
+    if not presets:
+        lines.append(row("No favorites. Press Tab, then F to add one.", "warning"))
 
     shortcut = f"1-{len(radio.stations)} Tune" if len(radio.stations) > 1 else "1 Tune"
-    tab_action = "TAB All" if radio.favorites_only else "TAB Filter"
+    tab_action = "TAB All" if radio.favorites_only else "TAB Favorites"
     lines.extend([
         row("N/P Next/prev | ENTER Play | SPACE Play/stop" if local
             else "UP/DOWN Browse | ENTER Tune | SPACE Play/stop", "dim"),
         row(f"{shortcut} | +/- Volume | M Mute | Q Quit", "dim"),
-        row("V View | X Fullscreen | H History | L Radio" if local
-            else "V View | X Fullscreen | H History | L Local", "dim"),
+        row("V View | X Full | H History | L Radio | O Dir" if local
+            else "V View | X Full | H History | L Local | O Dir", "dim"),
     ])
-    appearance = f"T {radio.theme} | A Motion"
+    appearance = f"T {radio.theme} | A {'On' if radio.header_motion else 'Off'}"
     lines.append(row(appearance if local else f"F Fav | {tab_action} | {appearance}", "dim"))
     lines.append(rule)
     return "\r\n".join(lines)

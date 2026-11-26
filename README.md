@@ -22,7 +22,7 @@ On other Linux distributions, install Python and an FFmpeg package that includes
 
 Put your music in the `music` folder beside `radio.py`, then press `L`. Night Signal queues supported files from the folder and its subfolders in path order. Press `N` or `P` to skip tracks, or `L` again to return to radio.
 
-If the folder is empty, Night Signal shows its full path. Press `C` to copy it or `L` to scan again after adding files.
+Press `O` to open the music folder in your file manager. If the folder is empty, Night Signal shows its full path. Press `C` to copy it and paste it into File Explorer's address bar, or press `L` to scan again after adding files.
 
 You can also launch with one or more files or folders as arguments.
 
@@ -49,13 +49,14 @@ Folder playback supports MP3, FLAC, WAV, M4A, AAC, AIFF, ALAC, Ogg, Opus, and WM
 | `V` | Switch between the waveform and spectrum |
 | `X` | Open or close the fullscreen spectrum |
 | `T` | Cycle through Classic, Amber, Chromatic, and Mono |
-| `A` | Toggle vertical motion in the tuner header |
+| `A` | Toggle horizontal motion for the title and GitHub link |
 | `H` | Open or close track history |
 | `C` in history | Copy the selected title |
 | `L` | Switch between local music and radio |
+| `O` | Open the local music folder |
 | `N` / `P` | Next or previous local track |
 | `F` | Add or remove the highlighted preset from favorites |
-| `Tab` | Switch between all presets and favorites |
+| `Tab` | Switch between all presets and favorites. Use `F` in all presets to add a favorite |
 | `Q` | Quit |
 
 In fullscreen mode, the spectrum runs from 20 Hz on the left to 20 kHz on the right. The `^` markers briefly hold peaks after a loud hit. Set `NO_COLOR=1` in your environment to override the color theme.

@@ -25,7 +25,7 @@ from spectrum import BAND_EDGES, FRAME_COUNT, Spectrum
 
 PRESETS = Path(__file__).with_name("stations.json")
 SETTINGS = Path(__file__).with_name("settings.json")
-MUSIC = Path(__file__).with_name("music")
+MUSIC = Path(__file__).absolute().with_name("music")
 SAMPLE_RATE = 44100
 BLOCK_BYTES = 4096
 HISTORY_LIMIT = 100
@@ -40,11 +40,23 @@ STREAM_TIMEOUT = 15
 RETRY_DELAYS = (2, 4, 8, 16, 30)
 STABLE_STREAM_TIME = 10
 ESC = "\x1b["
+GITHUB_REPO = "github.com/TurhanErgene/night-signal"
+HEADER_INTERVAL = 6
 TONE = (
     "aevalsrc=exprs='0.12*(sin(2*PI*110*t)+0.5*sin(2*PI*165*t))"
     "*pow(0.55+0.45*sin(2*PI*1.2*t),2)':sample_rate=44100"
 )
-PALETTE = {"bright": "1;97", "green": "1;92", "violet": "95", "dim": "90", "amber": "93"}
+PALETTES = {
+    "Classic": {"text": "1;97", "active": "1;92", "accent": "95", "dim": "90", "warning": "93"},
+    "Amber": {"text": "1;97", "active": "1;93", "accent": "33", "dim": "90", "warning": "91"},
+    "Chromatic": {"text": "97", "active": "1;96", "accent": "1;95", "dim": "90", "warning": "93"},
+    "Mono": {},
+}
+SPECTRUM_COLORS = (
+    "255;91;132", "255;113;111", "255;148;91", "255;190;92",
+    "243;219;105", "191;232;118", "117;232;153", "83;225;199",
+    "80;195;243", "116;164;255", "164;139;255", "222;127;248",
+)
 
 
 @dataclass(frozen=True)
@@ -89,7 +101,7 @@ def local_sources(paths):
     return list(files.values())
 
 
-def copy_title(title):
+def copy_to_clipboard(value, success):
     if os.name == "nt":
         commands, encoding = (("clip.exe",),), "utf-16"
     elif sys.platform == "darwin":
@@ -102,13 +114,13 @@ def copy_title(title):
         if executable is None:
             continue
         try:
-            result = subprocess.run([executable, *arguments], input=title.encode(encoding),
+            result = subprocess.run([executable, *arguments], input=value.encode(encoding),
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         except (OSError, subprocess.TimeoutExpired):
             continue
         if result.returncode == 0:
-            return "Title copied."
+            return success
     if sys.platform.startswith("linux"):
         return "Clipboard unavailable. Try wl-copy or xclip."
     return "Clipboard unavailable."
@@ -122,19 +134,39 @@ def plain(value):
     )
 
 
+def cell_width(character):
+    if category(character).startswith("M"):
+        return 0
+    return 2 if east_asian_width(character) in ("F", "W") else 1
+
+
 def fit_cells(value, width):
     if value.isascii():
         return value[:width].ljust(width)
     result = []
     for character in value:
-        cells = 0 if category(character).startswith("M") else (
-            2 if east_asian_width(character) in ("F", "W") else 1
-        )
+        cells = cell_width(character)
         if cells > width:
             break
         result.append(character)
         width -= cells
     return "".join(result) + " " * width
+
+
+def path_lines(path, width):
+    line = []
+    used = 0
+    for character in str(path):
+        character = character if character.isprintable() else "?"
+        cells = cell_width(character)
+        if used + cells > width:
+            yield "".join(line)
+            line = []
+            used = 0
+        line.append(character)
+        used += cells
+    if line:
+        yield "".join(line)
 
 
 def read_settings(path):
@@ -384,6 +416,10 @@ class Radio:
         self.volume = volume if type(volume) is int and 0 <= volume <= 100 else 65
         self.muted = settings.get("muted") is True
         self.show_spectrum = settings.get("spectrum") is True
+        theme = settings.get("theme")
+        self.theme = theme if isinstance(theme, str) and theme in PALETTES else "Classic"
+        self.header_motion = settings.get("header_motion") is not False
+        self.header_started = time.monotonic()
         stored_favorites = settings.get("favorites")
         self.favorites = (
             {url for url in stored_favorites if isinstance(url, str)}
@@ -406,8 +442,8 @@ class Radio:
                                                for field in ("title", "source", "heard_at"))))
         self.local_tracks = []
         self.local_index = None
-        self.notice = ""
-        self.notice_until = 0
+        self.music_help = ""
+        self.music_note = ""
         self.retry_at = None
         self.retry_count = 0
         self.on_air_since = None
@@ -425,6 +461,8 @@ class Radio:
                 "volume": self.volume,
                 "muted": self.muted,
                 "spectrum": self.show_spectrum,
+                "theme": self.theme,
+                "header_motion": self.header_motion,
                 "favorites": sorted(self.favorites),
                 "history": [{"title": track.title, "source": track.source, "heard_at": track.heard_at}
                             for track in self.history],
@@ -466,10 +504,18 @@ class Radio:
             self.stop()
             return
         try:
-            self.open_local(local_sources([MUSIC]))
-        except (OSError, ValueError):
-            self.notice = "Add audio files to the music folder, then press L."
-            self.notice_until = time.monotonic() + 5
+            MUSIC.mkdir(exist_ok=True)
+            tracks = local_sources([MUSIC])
+        except ValueError:
+            self.music_help = "Add MP3, FLAC, WAV, or other audio to:"
+            self.music_note = "Then press L to scan again."
+        except OSError:
+            self.music_help = "Could not open the local music folder:"
+            self.music_note = "Check that the folder is accessible, then press L."
+        else:
+            self.music_help = ""
+            self.music_note = ""
+            self.open_local(tracks)
 
     def select_local(self, index):
         self.stop()
@@ -561,7 +607,22 @@ class Radio:
             self.message = ""
 
     def handle_key(self, key):
-        if key == "h":
+        if key == "t":
+            themes = list(PALETTES)
+            self.theme = themes[(themes.index(self.theme) + 1) % len(themes)]
+            self.save()
+        elif key == "a":
+            self.header_motion = not self.header_motion
+            self.header_started = time.monotonic()
+            self.save()
+        elif self.music_help:
+            if key == "\x1b":
+                self.music_help = ""
+            elif key == "c":
+                self.music_note = copy_to_clipboard(str(MUSIC), "Music folder path copied.")
+            elif key == "l":
+                self.toggle_local()
+        elif key == "h":
             self.history_open = not self.history_open
             self.history_index = 0
             self.history_note = ""
@@ -573,7 +634,7 @@ class Radio:
             elif key in ("down", "j") and self.history:
                 self.history_index = min(len(self.history) - 1, self.history_index + 1)
             elif key == "c" and self.history:
-                self.history_note = copy_title(self.history[self.history_index].title)
+                self.history_note = copy_to_clipboard(self.history[self.history_index].title, "Title copied.")
         elif key == "x":
             self.fullscreen = not self.fullscreen
         elif key == "\x1b":
@@ -686,7 +747,7 @@ def dial(count, active, width):
     return "".join(labels), "".join(ticks)
 
 
-def screen(radio, columns, rows):
+def screen(radio, columns, rows, now=None):
     columns -= 1
     if not radio.fullscreen:
         columns = min(columns, 96)
@@ -694,23 +755,52 @@ def screen(radio, columns, rows):
         return "Resize terminal to 50 x 19, or press Q."[:max(1, columns)]
 
     inner = columns - 4
-    use_color = not os.environ.get("NO_COLOR")
+    palette = PALETTES[radio.theme] if not os.environ.get("NO_COLOR") else PALETTES["Mono"]
 
     def paint(value, tone):
-        return f"{ESC}{PALETTE[tone]}m{value}{ESC}0m" if use_color else value
+        color = palette.get(tone)
+        return f"{ESC}{color}m{value}{ESC}0m" if color else value
 
-    def row(value="", tone="bright"):
-        return paint("| ", "dim") + paint(fit_cells(value, inner), tone) + paint(" |", "dim")
+    def framed(value):
+        return paint("| ", "dim") + value + paint(" |", "dim")
+
+    def row(value="", tone="text"):
+        return framed(paint(fit_cells(value, inner), tone))
+
+    def scope_row(value, live):
+        if not live or radio.theme != "Chromatic" or not palette:
+            return row(value, "active" if live else "dim")
+        slices = []
+        count = len(SPECTRUM_COLORS)
+        for index, rgb in enumerate(SPECTRUM_COLORS):
+            segment = value[inner * index // count:inner * (index + 1) // count]
+            slices.append(f"{ESC}38;2;{rgb}m{segment}{ESC}0m" if segment.strip() else segment)
+        return framed("".join(slices))
 
     def split(left, right):
         right = right[:inner // 2]
         return fit_cells(left, inner - len(right) - 1) + " " + right
 
     rule = paint("+" + "-" * (columns - 2) + "+", "dim")
+    if radio.music_help:
+        parts = list(path_lines(MUSIC, inner))
+        visible = rows - 9
+        return "\r\n".join([
+            rule,
+            row("L O C A L   M U S I C", "accent"),
+            rule,
+            row(radio.music_help, "warning"),
+            *(row(part) for part in parts[:visible]),
+            *([row("...  Press C for the full path.")] if len(parts) > visible else []),
+            row(radio.music_note, "accent"),
+            row("C Copy path | L Scan again | ESC Back", "dim"),
+            rule,
+        ])
+
     if radio.history_open:
         top = [
             rule,
-            row("T R A C K   H I S T O R Y", "violet"),
+            row("T R A C K   H I S T O R Y", "accent"),
             rule,
         ]
         if radio.history:
@@ -720,14 +810,14 @@ def screen(radio, columns, rows):
             for index, track in enumerate(tracks[start:start + visible], start):
                 cursor = ">" if index == radio.history_index else " "
                 top.append(row(f"{cursor} {track.heard_at[5:]}  {track.title}",
-                               "green" if cursor == ">" else "bright"))
+                               "active" if cursor == ">" else "text"))
             top.append(rule)
             top.append(row(f"Source: {tracks[radio.history_index].source}"))
         else:
             top.append(row("Play a local file or a station with track titles."))
         top.extend([
-            row(radio.history_note, "amber"),
-            row("UP/DOWN Browse | C Copy | H / ESC Back", "dim"),
+            row(radio.history_note, "warning"),
+            row("UP/DOWN Browse | C Copy | T Theme | H Back", "dim"),
             rule,
         ])
         return "\r\n".join(top)
@@ -737,7 +827,7 @@ def screen(radio, columns, rows):
     local = radio.local_index is not None
     active = radio.tuned if tuning and not local else radio.selected
     station = radio.source() if local else radio.stations[active]
-    status_color = "green" if live else "amber"
+    status_color = "active" if live else "warning"
     height = 5 if rows >= 28 else 3
     if local:
         labels = "LOCAL MUSIC"
@@ -758,9 +848,6 @@ def screen(radio, columns, rows):
         message = f"Now playing: {title}" if title else "Track title unavailable"
     if radio.settings_warning:
         message = radio.settings_warning
-    if time.monotonic() < radio.notice_until:
-        message = radio.notice
-
     if radio.fullscreen:
         bands = radio.playback.bands if live else ()
         peaks = radio.playback.peaks if live else ()
@@ -769,26 +856,35 @@ def screen(radio, columns, rows):
         return "\r\n".join([
             rule,
             row(split("SPECTRUM 20Hz-20kHz", f"[ {radio.status} ]"), status_color),
-            row(split(station.name, f"VOL {volume}"), "violet"),
+            row(split(station.name, f"VOL {volume}"), "accent"),
             row(message),
             rule,
-            *(row(line, "green") for line in spectrum_bars(bands, inner, rows - 10, peaks)),
-            row(axis, "violet"),
+            *(scope_row(line, live) for line in spectrum_bars(bands, inner, rows - 10, peaks)),
+            row(axis, "accent"),
             rule,
-            row("X/ESC Back | SPACE Play | +/- Vol | Q Quit", "dim"),
+            row(f"X Back | SPACE Play/stop | T {radio.theme}", "dim"),
             rule,
         ])
 
+    star_text = f"* Star: {GITHUB_REPO}"
+    star_link = f"\x1b]8;;https://{GITHUB_REPO}\x1b\\{star_text}\x1b]8;;\x1b\\"
+    header = [
+        row(split("N I G H T   S I G N A L", f"[ {radio.status} ]"), status_color),
+        framed(paint(star_link, "accent") + " " * (inner - len(star_text))),
+    ]
+    now = time.monotonic() if now is None else now
+    if radio.header_motion and int((now - radio.header_started) / HEADER_INTERVAL) % 2:
+        header.reverse()
+
     lines = [
         rule,
-        row(split("N I G H T   S I G N A L", f"[ {radio.status} ]"), status_color),
-        rule,
+        *header,
         row(labels, "dim"),
-        row(ticks, "violet"),
+        row(ticks, "accent"),
         row(split(station.name, station.genre)),
-        row(split(view, f"VOL {volume}"), "violet"),
-        *(row(line, "green" if live else "dim") for line in plot),
-        row(message, "bright" if live else "amber"),
+        row(split(view, f"VOL {volume}"), "accent"),
+        *(scope_row(line, live) for line in plot),
+        row(message, "text" if live else "warning"),
         rule,
     ]
 
@@ -805,10 +901,10 @@ def screen(radio, columns, rows):
         text = f"{cursor}{on_air}{favorite} {index + 1:02}  {preset.name}"
         if not local:
             text = split(text, preset.genre)
-        lines.append(row(text, "green" if cursor == ">" else "bright"))
+        lines.append(row(text, "active" if cursor == ">" else "text"))
 
     shortcut = f"1-{len(radio.stations)} Tune" if len(radio.stations) > 1 else "1 Tune"
-    tab_action = "TAB All presets" if radio.favorites_only else "TAB Favorites"
+    tab_action = "TAB All" if radio.favorites_only else "TAB Filter"
     lines.extend([
         row("N/P Next/prev | ENTER Play | SPACE Play/stop" if local
             else "UP/DOWN Browse | ENTER Tune | SPACE Play/stop", "dim"),
@@ -816,10 +912,15 @@ def screen(radio, columns, rows):
         row("V View | X Fullscreen | H History | L Radio" if local
             else "V View | X Fullscreen | H History | L Local", "dim"),
     ])
-    if not local:
-        lines.append(row(f"F Favorite | {tab_action}", "dim"))
+    appearance = f"T {radio.theme} | A Motion"
+    lines.append(row(appearance if local else f"F Fav | {tab_action} | {appearance}", "dim"))
     lines.append(rule)
     return "\r\n".join(lines)
+
+
+def frame_output(frame):
+    # Clear every row past its right edge when returning from a wider view.
+    return f"{ESC}H" + f"{ESC}K\r\n".join(frame.split("\r\n")) + f"{ESC}K{ESC}J"
 
 
 @contextmanager
@@ -933,11 +1034,12 @@ def main():
                     radio.start_playback()
                 last_frame = ""
                 while True:
-                    radio.update(time.monotonic())
+                    now = time.monotonic()
+                    radio.update(now)
                     size = shutil.get_terminal_size(fallback=(80, 28))
-                    frame = screen(radio, size.columns, size.lines)
+                    frame = screen(radio, size.columns, size.lines, now)
                     if frame != last_frame:
-                        print(f"{ESC}H{frame}{ESC}J", end="", flush=True)
+                        print(frame_output(frame), end="", flush=True)
                         last_frame = frame
                     key = read_key()
                     if key in ("q", "\x03"):

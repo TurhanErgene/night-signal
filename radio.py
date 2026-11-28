@@ -2,6 +2,7 @@
 
 import argparse
 import array
+import codecs
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from math import ceil
 import os
 from pathlib import Path
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -21,14 +23,22 @@ from unicodedata import category, east_asian_width, normalize
 from urllib.parse import urlsplit
 
 from spectrum import BAND_EDGES, FRAME_COUNT, Spectrum
+from station_directory import Discovery, SEARCH_FIELDS, Station, clean_text, custom_station, stream_host
+
+if os.name == "nt":
+    from windows_audio import DecoderJob, WindowsAudio
 
 
 PRESETS = Path(__file__).with_name("stations.json")
 SETTINGS = Path(__file__).with_name("settings.json")
 MUSIC = Path(__file__).absolute().with_name("music")
+VERSION = "1.0.0"
 SAMPLE_RATE = 44100
 BLOCK_BYTES = 4096
 HISTORY_LIMIT = 100
+CUSTOM_PRESET_LIMIT = 200
+WATERFALL_ROWS = 120
+SLEEP_MINUTES = (0, 15, 30, 60)
 MUSIC_EXTENSIONS = {".aac", ".aif", ".aiff", ".alac", ".flac", ".m4a", ".mp3",
                     ".oga", ".ogg", ".opus", ".wav", ".wma"}
 # The decoder supplies raw PCM. Send it to ffplay with a streaming WAV header
@@ -60,22 +70,10 @@ SPECTRUM_COLORS = (
 
 
 @dataclass(frozen=True)
-class Station:
-    name: str
-    genre: str
-    url: str = ""
-    file: Path | None = None
-
-
-@dataclass(frozen=True)
 class Track:
     title: str
     source: str
     heard_at: str
-
-
-def clean_text(value):
-    return "".join(character for character in " ".join(value.split()) if character.isprintable())
 
 
 def local_sources(paths):
@@ -227,11 +225,46 @@ def load_presets():
         ):
             raise ValueError(f"Preset {number} needs a name, genre and URL.")
         name, genre, url = (entry[field].strip() for field in fields)
-        parsed = urlsplit(url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        try:
+            stream_host(url)
+        except ValueError:
             raise ValueError(f"Preset {number} needs a direct HTTP(S) stream URL.")
         stations.append(Station(plain(name), plain(genre), url))
     return stations
+
+
+def custom_presets(data, built_in):
+    if not isinstance(data, list):
+        return []
+    urls = {station.url for station in built_in}
+    presets = []
+    for item in data[:CUSTOM_PRESET_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        name = item.get("name")
+        genre = item.get("genre")
+        if not all(isinstance(value, str) for value in (url, name, genre)) or url in urls:
+            continue
+        try:
+            host = stream_host(url)
+        except ValueError:
+            continue
+        urls.add(url)
+        presets.append(Station(clean_text(name) or host, clean_text(genre) or "Custom stream", url))
+    return presets
+
+
+def load_tracks(data):
+    if isinstance(data, list):
+        for item in data:
+            fields = ("title", "source", "heard_at")
+            if isinstance(item, dict) and all(isinstance(item.get(field), str) for field in fields):
+                yield Track(*(clean_text(item[field]) for field in fields))
+
+
+def track_records(tracks):
+    return [{"title": track.title, "source": track.source, "heard_at": track.heard_at} for track in tracks]
 
 
 def find_executable(name):
@@ -258,6 +291,7 @@ class Playback:
         self.trace = ()
         self.bands = ()
         self.peaks = ()
+        self.waterfall = deque(maxlen=WATERFALL_ROWS)
         self.local = station.file is not None
         self.title = station.name if self.local else "" if station.url else "Night Signal test tone"
         self.end_of_input = False
@@ -265,36 +299,53 @@ class Playback:
         self.started = time.monotonic()
         self.stop_requested = threading.Event()
         self.decoder_errors = deque(maxlen=8)
-        self.player_log = tempfile.TemporaryFile()
+        self.player_log = None
+        self.audio_output = None
+        self.decoder_job = None
+        self.output_error = ""
         self.decoder = self.player = self.worker = self.metadata_reader = None
 
+        # Native output already paces the decoder through its bounded queue.
+        pace = ["-re"] if player is not None else []
         if self.local:
-            source = ["-re", "-protocol_whitelist", "file", "-i", str(station.file)]
+            source = [*pace, "-protocol_whitelist", "file", "-i", str(station.file)]
         elif station.url:
-            source = ["-rw_timeout", "8000000", "-icy", "1"]
+            source = ["-rw_timeout", "8000000", "-icy", "1",
+                      "-protocol_whitelist", "http,https,tcp,tls,httpproxy,crypto"]
             if urlsplit(station.url).scheme == "https":
                 source += ["-tls_verify", "1"]
             source += ["-i", station.url]
         else:
-            source = ["-re", "-f", "lavfi", "-i", TONE]
+            source = [*pace, "-f", "lavfi", "-i", TONE]
         output = ["-map", "0:a:0", "-vn", "-ac", "2", "-ar", str(SAMPLE_RATE),
                   "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1"]
         player_input = ["-f", "wav", "-ignore_length", "1", "-probesize", "32", "-i", "pipe:0"]
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
         try:
+            if player is None:
+                self.audio_output = WindowsAudio(SAMPLE_RATE, BLOCK_BYTES)
+                self.set_muted(muted)
+            if os.name == "nt":
+                self.decoder_job = DecoderJob()
             self.decoder = subprocess.Popen(
                 [decoder, "-hide_banner", "-nostdin", "-loglevel", "level+verbose",
                  *source, *output],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 creationflags=flags,
             )
-            self.player = subprocess.Popen(
-                [player, "-hide_banner", "-loglevel", "error", "-nostats",
-                 "-nodisp", "-autoexit", *player_input],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.player_log,
-                creationflags=flags,
-            )
+            if self.decoder_job is not None:
+                self.decoder_job.add(self.decoder.pid)
+            if player is not None:
+                self.player_log = tempfile.TemporaryFile()
+                self.player = subprocess.Popen(
+                    [player, "-hide_banner", "-loglevel", "error", "-nostats",
+                     "-nodisp", "-autoexit", *player_input],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.player_log,
+                    creationflags=flags,
+                )
+                if self.decoder_job is not None:
+                    self.decoder_job.add(self.player.pid)
         except OSError:
             self.close()
             raise
@@ -303,6 +354,14 @@ class Playback:
         self.metadata_reader.start()
         self.worker = threading.Thread(target=self.pump, daemon=True)
         self.worker.start()
+
+    def set_muted(self, muted):
+        try:
+            device_mute = self.audio_output is not None and self.audio_output.set_muted(muted)
+        except OSError as error:
+            self.output_error = error.strerror or str(error)
+            return
+        self.muted = muted and not device_mute
 
     def read_metadata(self):
         marker = "Metadata update for StreamTitle: "
@@ -332,11 +391,14 @@ class Playback:
         spectrum_samples = deque(maxlen=FRAME_COUNT * 2)
         frames_since_spectrum = 0
         try:
-            self.player.stdin.write(WAV_HEADER)
+            if self.player is not None:
+                self.player.stdin.write(WAV_HEADER)
             while not self.stop_requested.is_set():
                 block = self.decoder.stdout.read(BLOCK_BYTES)
                 if not block:
                     self.end_of_input = True
+                    if self.local and self.audio_output is not None:
+                        self.audio_output.drain(self.stop_requested)
                     return
 
                 samples = array.array("h", block)
@@ -349,6 +411,8 @@ class Playback:
                     (samples[index] + samples[index + 1]) / 65536
                     for index in range(0, len(samples) - 1, stride)
                 )
+                if self.audio_output is not None and not self.audio_output.wait_for_slot(self.stop_requested):
+                    return
                 volume = self.volume
                 if self.muted or volume == 0:
                     block = bytes(len(block))
@@ -358,8 +422,11 @@ class Playback:
                         scaled.byteswap()
                     block = scaled.tobytes()
 
-                self.player.stdin.write(block)
-                self.player.stdin.flush()
+                if self.audio_output is not None:
+                    self.audio_output.write(block)
+                else:
+                    self.player.stdin.write(block)
+                    self.player.stdin.flush()
                 self.trace = trace
                 self.last_audio = time.monotonic()
 
@@ -368,24 +435,35 @@ class Playback:
                 if frames_since_spectrum >= FRAME_COUNT:
                     self.bands = spectrum.measure(list(spectrum_samples))
                     self.peaks = spectrum.peaks
+                    self.waterfall.append(self.bands)
                     frames_since_spectrum = 0
-        except OSError:
-            # The UI reads the subprocess diagnostics when the pipe closes.
-            return
+        except OSError as error:
+            if self.audio_output is not None and not self.stop_requested.is_set():
+                self.output_error = error.strerror or str(error)
         finally:
-            if self.local:
+            if self.local and self.player is not None:
                 try:
                     self.player.stdin.close()
                 except OSError:
                     pass
 
     def finished_file(self):
-        return (self.local and self.end_of_input and self.last_audio is not None
-                and self.decoder.poll() == 0 and self.player.poll() == 0)
+        if not (self.local and self.end_of_input and self.last_audio is not None
+                and self.decoder.poll() == 0):
+            return False
+        if self.audio_output is not None:
+            return not self.worker.is_alive() and not self.output_error
+        return self.player.poll() == 0
+
+    def output_failed(self):
+        return bool(self.output_error) or (self.player is not None and self.player.poll() is not None)
 
     def problem(self, now):
-        draining_file = self.local and self.end_of_input and self.last_audio is not None
-        if self.player.poll() is not None or (not self.worker.is_alive() and not draining_file):
+        if self.output_error:
+            return self.output_error
+        draining_file = (self.local and self.end_of_input and self.last_audio is not None
+                         and self.decoder.poll() in (None, 0))
+        if self.output_failed() or (not self.worker.is_alive() and not draining_file):
             return "Audio stream ended."
         if now - (self.last_audio or self.started) > STREAM_TIMEOUT:
             return "Stream timed out."
@@ -393,6 +471,8 @@ class Playback:
 
     def close(self):
         self.stop_requested.set()
+        if self.decoder_job is not None:
+            self.decoder_job.close()
         for process in (self.player, self.decoder):
             if process is not None and process.poll() is None:
                 process.kill()
@@ -401,6 +481,8 @@ class Playback:
                 process.wait()
         if self.worker is not None:
             self.worker.join()
+        if self.audio_output is not None:
+            self.audio_output.close()
         if self.metadata_reader is not None:
             self.metadata_reader.join()
         if self.decoder is not None:
@@ -412,21 +494,24 @@ class Playback:
             except OSError:
                 pass
 
-        log_size = self.player_log.seek(0, os.SEEK_END)
-        self.player_log.seek(max(0, log_size - 2048))
-        player_errors = self.player_log.read().decode("utf-8", errors="replace").splitlines()
-        self.player_log.close()
+        player_errors = [self.output_error] if self.output_error else []
+        if self.player_log is not None:
+            log_size = self.player_log.seek(0, os.SEEK_END)
+            self.player_log.seek(max(0, log_size - 2048))
+            player_errors.extend(self.player_log.read().decode("utf-8", errors="replace").splitlines())
+            self.player_log.close()
         return player_errors + list(self.decoder_errors)
 
 
 class Radio:
     def __init__(self, stations, decoder, player, settings_path=None):
-        self.stations = stations
         self.decoder = decoder
         self.player = player
         self.settings_path = settings_path
         settings = read_settings(settings_path)
-        self.tuned = next((index for index, station in enumerate(stations)
+        self.built_in_count = len(stations)
+        self.stations = [*stations, *custom_presets(settings.get("custom_presets"), stations)]
+        self.tuned = next((index for index, station in enumerate(self.stations)
                            if station.url and station.url == settings.get("station")), None)
         self.selected = self.tuned if self.tuned is not None else 0
         self.playback = None
@@ -445,19 +530,19 @@ class Radio:
         )
         self.favorites_only = False
         self.settings_warning = ""
-        self.fullscreen = False
-        self.history_open = False
+        self.fullscreen = ""
+        self.track_view = ""
         self.history_index = 0
         self.history_note = ""
-        self.history = deque(maxlen=HISTORY_LIMIT)
-        history_data = settings.get("history")
-        if isinstance(history_data, list):
-            for entry in history_data[:HISTORY_LIMIT]:
-                if isinstance(entry, dict) and all(
-                    isinstance(entry.get(field), str) for field in ("title", "source", "heard_at")
-                ):
-                    self.history.append(Track(*(clean_text(entry[field])
-                                               for field in ("title", "source", "heard_at"))))
+        history = list(load_tracks(settings.get("history")))
+        self.history = deque(history[:HISTORY_LIMIT], maxlen=HISTORY_LIMIT)
+        self.saved_tracks = list(load_tracks(settings.get("saved_tracks")))
+        self.discovery = Discovery()
+        self.discovery_open = False
+        self.sleep_index = 0
+        self.sleep_at = None
+        self.notice = ""
+        self.notice_until = 0
         self.local_tracks = []
         self.local_index = None
         self.music_help = ""
@@ -482,8 +567,10 @@ class Radio:
                 "theme": self.theme,
                 "header_motion": self.header_motion,
                 "favorites": sorted(self.favorites),
-                "history": [{"title": track.title, "source": track.source, "heard_at": track.heard_at}
-                            for track in self.history],
+                "history": track_records(self.history),
+                "saved_tracks": track_records(self.saved_tracks),
+                "custom_presets": [{"name": preset.name, "genre": preset.genre, "url": preset.url}
+                                   for preset in self.stations[self.built_in_count:]],
             })
         except OSError:
             self.settings_warning = "Could not save settings."
@@ -505,10 +592,94 @@ class Radio:
     def log_track(self, title, source):
         if self.history and (self.history[0].title, self.history[0].source) == (title, source):
             return
-        if self.history_open and self.history:
+        if self.track_view == "history" and self.history:
             self.history_index = min(self.history_index + 1, HISTORY_LIMIT - 1)
         self.history.appendleft(Track(title, source, datetime.now().strftime("%Y-%m-%d %H:%M")))
         self.save()
+
+    def track_list(self):
+        return self.saved_tracks if self.track_view == "saved" else self.history
+
+    def bookmark(self, track):
+        if any((saved.title, saved.source) == (track.title, track.source) for saved in self.saved_tracks):
+            return "Track already saved."
+        self.saved_tracks.insert(0, track)
+        self.save()
+        return "Track saved. Press B to view saved songs."
+
+    def notify(self, message):
+        self.notice = message
+        self.notice_until = time.monotonic() + 4
+
+    def save_current_track(self):
+        source = self.source()
+        if self.playback is None or not self.playback.title or not (source.url or source.file):
+            self.notify("No track title to save.")
+            return
+        title = self.playback.title
+        name = "Local file" if source.file else source.name
+        self.notify(self.bookmark(Track(title, name, datetime.now().strftime("%Y-%m-%d %H:%M"))))
+
+    def add_preset(self, station):
+        for index, existing in enumerate(self.stations):
+            if existing.url == station.url:
+                return index
+        if len(self.stations) - self.built_in_count >= CUSTOM_PRESET_LIMIT:
+            raise ValueError("Custom preset list is full.")
+        self.stations.append(station)
+        self.save()
+        return len(self.stations) - 1
+
+    def typing_station_query(self):
+        return self.discovery_open and not self.discovery.results and self.discovery.pending is None
+
+    def handle_discovery(self, key):
+        panel = self.discovery
+        if key == "\x1b":
+            self.discovery_open = False
+        elif panel.pending is not None:
+            return
+        elif key == "\t":
+            panel.field = SEARCH_FIELDS[(SEARCH_FIELDS.index(panel.field) + 1) % len(SEARCH_FIELDS)]
+            panel.clear()
+        elif panel.results:
+            if key in ("up", "k", "down", "j"):
+                direction = -1 if key in ("up", "k") else 1
+                panel.selected = (panel.selected + direction) % len(panel.results)
+            elif key == "/":
+                panel.clear()
+            elif key in ("p", "\r", "\n"):
+                try:
+                    index = self.add_preset(panel.results[panel.selected])
+                except ValueError as error:
+                    panel.note = str(error)
+                    return
+                panel.note = "Preset saved."
+                if key != "p":
+                    self.selected = index
+                    self.favorites_only = False
+                    self.discovery_open = False
+                    self.tune()
+        elif key in ("\b", "\x7f"):
+            panel.query = panel.query[:-1]
+        elif key in ("\r", "\n"):
+            if not panel.query.strip():
+                panel.note = "Enter a search term or stream URL first."
+            elif panel.field == "URL":
+                try:
+                    self.selected = self.add_preset(custom_station(panel.query))
+                except ValueError as error:
+                    panel.note = str(error)
+                    return
+                panel.clear()
+                self.favorites_only = False
+                self.discovery_open = False
+                self.notify("Preset saved." if self.local_index is not None
+                            else "Preset saved. Press Enter to tune.")
+            else:
+                panel.search()
+        elif len(key) == 1 and key.isprintable() and len(panel.query) < 2048:
+            panel.query += key
 
     def open_local(self, tracks):
         self.stop()
@@ -573,6 +744,14 @@ class Radio:
         )
 
     def update(self, now):
+        self.discovery.update()
+        if self.sleep_at is not None and now >= self.sleep_at:
+            self.sleep_at = None
+            self.sleep_index = 0
+            self.stop()
+            self.notice_until = 0
+            self.message = "Sleep timer ended. Playback stopped."
+            return
         if self.retry_at is not None:
             if now < self.retry_at:
                 seconds = ceil(self.retry_at - now)
@@ -599,7 +778,7 @@ class Radio:
 
         issue = self.playback.problem(now)
         if issue:
-            can_retry = source.url and self.playback.player.poll() is None
+            can_retry = source.url and not self.playback.output_failed()
             diagnostics = self.playback.close()
             self.playback = None
             self.on_air_since = None
@@ -625,7 +804,20 @@ class Radio:
             self.message = ""
 
     def handle_key(self, key):
-        if key == "t":
+        if key in ("left", "right"):
+            self.adjust_audio("-" if key == "left" else "+")
+            return
+        if self.discovery_open:
+            self.handle_discovery(key if self.typing_station_query() else key.lower())
+            return
+        key = key.lower()
+        if key == "z":
+            self.sleep_index = (self.sleep_index + 1) % len(SLEEP_MINUTES)
+            minutes = SLEEP_MINUTES[self.sleep_index]
+            self.sleep_at = time.monotonic() + minutes * 60 if minutes else None
+            if not minutes:
+                self.notify("Sleep timer off.")
+        elif key == "t":
             themes = list(PALETTES)
             self.theme = themes[(themes.index(self.theme) + 1) % len(themes)]
             self.save()
@@ -642,35 +834,50 @@ class Radio:
                 self.music_note = open_music_folder()
             elif key == "l":
                 self.toggle_local()
-        elif key == "h":
-            self.history_open = not self.history_open
+        elif key in ("h", "b"):
+            view = "history" if key == "h" else "saved"
+            self.track_view = "" if self.track_view == view else view
             self.history_index = 0
             self.history_note = ""
-        elif self.history_open:
+        elif self.track_view:
+            tracks = self.track_list()
             if key == "\x1b":
-                self.history_open = False
+                self.track_view = ""
             elif key in ("up", "k"):
                 self.history_index = max(0, self.history_index - 1)
-            elif key in ("down", "j") and self.history:
-                self.history_index = min(len(self.history) - 1, self.history_index + 1)
-            elif key == "c" and self.history:
-                self.history_note = copy_to_clipboard(self.history[self.history_index].title, "Title copied.")
-        elif key == "x":
-            self.fullscreen = not self.fullscreen
+            elif key in ("down", "j") and tracks:
+                self.history_index = min(len(tracks) - 1, self.history_index + 1)
+            elif key == "c" and tracks:
+                self.history_note = copy_to_clipboard(tracks[self.history_index].title, "Title copied.")
+            elif key == "s" and tracks:
+                if self.track_view == "saved":
+                    del self.saved_tracks[self.history_index]
+                    self.history_index = max(0, min(self.history_index, len(self.saved_tracks) - 1))
+                    self.history_note = "Saved track removed."
+                    self.save()
+                else:
+                    self.history_note = self.bookmark(tracks[self.history_index])
+        elif key == "/":
+            self.discovery_open = True
+        elif key == "s":
+            self.save_current_track()
+        elif key in ("x", "w"):
+            view = "spectrum" if key == "x" else "waterfall"
+            self.fullscreen = "" if self.fullscreen == view else view
         elif key == "\x1b":
-            self.fullscreen = False
+            self.fullscreen = ""
         elif key == "l":
             self.toggle_local()
         elif key == "o":
             self.music_help = "Music folder:"
             self.music_note = open_music_folder()
-        elif self.local_index is not None and key in ("up", "left", "k", "p", "down", "right", "j", "n"):
-            direction = -1 if key in ("up", "left", "k", "p") else 1
+        elif self.local_index is not None and key in ("up", "k", "p", "down", "j", "n"):
+            direction = -1 if key in ("up", "k", "p") else 1
             self.select_local((self.local_index + direction) % len(self.local_tracks))
-        elif key in ("up", "left", "k", "down", "right", "j"):
+        elif key in ("up", "k", "down", "j"):
             presets = self.preset_indices()
             if presets:
-                direction = -1 if key in ("up", "left", "k") else 1
+                direction = -1 if key in ("up", "k") else 1
                 self.selected = presets[(presets.index(self.selected) + direction) % len(presets)]
         elif len(key) == 1 and key in "123456789" and int(key) <= len(self.stations):
             self.selected = int(key) - 1
@@ -704,19 +911,22 @@ class Radio:
             self.keep_preset_visible()
             self.save()
         elif key == "\t" and self.local_index is None:
-            self.fullscreen = False
+            self.fullscreen = ""
             self.favorites_only = not self.favorites_only
             self.keep_preset_visible()
         elif key in ("+", "=", "-", "m"):
-            if key == "m":
-                self.muted = not self.muted
-            else:
-                change = -5 if key == "-" else 5
-                self.volume = max(0, min(100, self.volume + change))
-            if self.playback is not None:
-                self.playback.volume = self.volume
-                self.playback.muted = self.muted
-            self.save()
+            self.adjust_audio(key)
+
+    def adjust_audio(self, key):
+        if key == "m":
+            self.muted = not self.muted
+        else:
+            change = -5 if key == "-" else 5
+            self.volume = max(0, min(100, self.volume + change))
+        if self.playback is not None:
+            self.playback.volume = self.volume
+            self.playback.set_muted(self.muted)
+        self.save()
 
     def keep_preset_visible(self):
         presets = self.preset_indices()
@@ -760,6 +970,19 @@ def spectrum_bars(levels, width, height, peaks=()):
     return rows
 
 
+def waterfall_lines(history, width, height):
+    intensity = " .:-=+*#%@"
+    count = len(BAND_EDGES) - 1
+    widths = [width * (index + 1) // count - width * index // count for index in range(count)]
+    window = list(history)[-height:]
+    blank = [" " * width] * (height - len(window))
+    return blank + [
+        "".join(intensity[round(level * (len(intensity) - 1))] * size
+                for level, size in zip(levels, widths))
+        for levels in window
+    ]
+
+
 def dial(count, active, width):
     if count == 1:
         return "01", "^"
@@ -783,8 +1006,8 @@ def screen(radio, columns, rows, now=None):
     columns -= 1
     if not radio.fullscreen:
         columns = min(columns, 96)
-    if columns < 49 or rows < 19:
-        return "Resize terminal to 50 x 19, or press Q."[:max(1, columns)]
+    if columns < 49 or rows < 20:
+        return "Resize terminal to 50 x 20, or press Q."[:max(1, columns)]
 
     inner = columns - 4
     palette = PALETTES[radio.theme] if not os.environ.get("NO_COLOR") else PALETTES["Mono"]
@@ -813,12 +1036,52 @@ def screen(radio, columns, rows, now=None):
         right = right[:inner // 2]
         return fit_cells(left, inner - len(right) - 1) + " " + right
 
+    now = time.monotonic() if now is None else now
     rule = paint("+" + "-" * (columns - 2) + "+", "dim")
+    top_rule = rule
+    if radio.sleep_at is not None:
+        remaining = max(0, ceil(radio.sleep_at - now))
+        minutes, seconds = divmod(remaining, 60)
+        label = f" Sleep {minutes:02}:{seconds:02} "
+        top_rule = paint("+" + "-" * (columns - 2 - len(label)), "dim")
+        top_rule += paint(label, "warning") + paint("+", "dim")
+
+    if radio.discovery_open:
+        panel = radio.discovery
+        query = panel.query or "_"
+        if len(query) > inner - 12:
+            query = "..." + query[-(inner - 15):]
+        lines = [
+            top_rule,
+            row("S T A T I O N   D I S C O V E R Y", "accent"),
+            row(f"{panel.field}: {query}"),
+            rule,
+        ]
+        if panel.results:
+            visible = rows - 10
+            start = max(0, panel.selected - visible + 1)
+            for index, station in enumerate(panel.results[start:start + visible], start):
+                cursor = ">" if index == panel.selected else " "
+                lines.append(row(split(f"{cursor} {station.name}", station.genre),
+                                 "active" if cursor == ">" else "text"))
+            lines.append(row("Enter Tune + save | P Save | / New search", "dim"))
+        elif panel.field == "URL":
+            lines.append(row("Paste a URL or enter Name | URL.", "dim"))
+            lines.append(row("Enter Save preset", "dim"))
+        else:
+            lines.append(row("Type a search term, then press Enter.", "dim"))
+        lines.extend([
+            row(panel.note or radio.settings_warning, "warning"),
+            row("Tab Name / Genre / Country / URL | Esc Back", "dim"),
+            rule,
+        ])
+        return "\r\n".join(lines)
+
     if radio.music_help:
         parts = list(path_lines(MUSIC, inner))
         visible = rows - 9
         return "\r\n".join([
-            rule,
+            top_rule,
             row("L O C A L   M U S I C", "accent"),
             rule,
             row(radio.music_help, "warning"),
@@ -830,14 +1093,15 @@ def screen(radio, columns, rows, now=None):
             rule,
         ])
 
-    if radio.history_open:
+    if radio.track_view:
+        saved = radio.track_view == "saved"
         top = [
-            rule,
-            row("T R A C K   H I S T O R Y", "accent"),
+            top_rule,
+            row("S A V E D   S O N G S" if saved else "T R A C K   H I S T O R Y", "accent"),
             rule,
         ]
-        if radio.history:
-            tracks = list(radio.history)
+        tracks = list(radio.track_list())
+        if tracks:
             visible = rows - 9
             start = max(0, radio.history_index - visible + 1)
             for index, track in enumerate(tracks[start:start + visible], start):
@@ -847,10 +1111,12 @@ def screen(radio, columns, rows, now=None):
             top.append(rule)
             top.append(row(f"Source: {tracks[radio.history_index].source}"))
         else:
-            top.append(row("Play a local file or a station with track titles."))
+            top.append(row("Press S while a track is playing to save it." if saved
+                           else "Play a file or station with track titles."))
         top.extend([
             row(radio.history_note, "warning"),
-            row("UP/DOWN Browse | C Copy | T Theme | H Back", "dim"),
+            row("Up/Down Browse | C Copy | S Remove | Esc Back" if saved
+                else "Up/Down Browse | C Copy | S Save | Esc Back", "dim"),
             rule,
         ])
         return "\r\n".join(top)
@@ -866,7 +1132,10 @@ def screen(radio, columns, rows, now=None):
         labels = "LOCAL MUSIC"
         ticks = f"Track {radio.local_index + 1} of {len(radio.local_tracks)}"
     else:
-        labels, ticks = dial(len(radio.stations), active, inner)
+        page = active // 9 * 9
+        labels, ticks = dial(min(9, len(radio.stations) - page), active - page, inner)
+        if len(radio.stations) > 9:
+            labels = f"PRESET {active + 1:02} / {len(radio.stations):02}"
     filled = round(radio.volume / 10)
     volume = "MUTED" if radio.muted else f"[{'#' * filled}{'.' * (10 - filled)}] {radio.volume:3}%"
     if radio.show_spectrum:
@@ -881,21 +1150,30 @@ def screen(radio, columns, rows, now=None):
         message = f"Now playing: {title}" if title else "Track title unavailable"
     if radio.settings_warning:
         message = radio.settings_warning
+    elif now < radio.notice_until:
+        message = radio.notice
     if radio.fullscreen:
         bands = radio.playback.bands if live else ()
         peaks = radio.playback.peaks if live else ()
+        waterfall = radio.fullscreen == "waterfall"
+        label = "WATERFALL 20Hz-20kHz" if waterfall else "SPECTRUM 20Hz-20kHz"
+        if waterfall:
+            history = radio.playback.waterfall if live else ()
+            chart = waterfall_lines(history, inner, rows - 10)
+        else:
+            chart = spectrum_bars(bands, inner, rows - 10, peaks)
         third = inner // 3
         axis = ("BASS".center(third) + "MIDS".center(third) + "TREBLE".center(inner - 2 * third))
         return "\r\n".join([
-            rule,
-            row(split("SPECTRUM 20Hz-20kHz", f"[ {radio.status} ]"), status_color),
+            top_rule,
+            row(split(label, f"[ {radio.status} ]"), status_color),
             row(split(station.name, f"VOL {volume}"), "accent"),
             row(message),
             rule,
-            *(scope_row(line, live) for line in spectrum_bars(bands, inner, rows - 10, peaks)),
+            *(scope_row(line, live) for line in chart),
             row(axis, "accent"),
             rule,
-            row(f"X Back | SPACE Play/stop | T {radio.theme}", "dim"),
+            row("W Back | X Spectrum | Z Sleep" if waterfall else "X Back | W Waterfall | Z Sleep", "dim"),
             rule,
         ])
 
@@ -906,14 +1184,13 @@ def screen(radio, columns, rows, now=None):
     star_text = f"{' ' if inner < 54 else ' Star: '}{GITHUB_REPO}"
     star_label = paint("*", "star") + paint(star_text, "accent")
     star_link = f"\x1b]8;;https://{GITHUB_REPO}\x1b\\{star_label}\x1b]8;;\x1b\\"
-    now = time.monotonic() if now is None else now
     elapsed = now - radio.header_started if radio.header_motion else 0
     title_left = header_offset(elapsed, inner - len(status) - 1 - len(title))
     star_space = inner - 1 - len(star_text)
     star_left = header_offset(elapsed, star_space)
 
     lines = [
-        rule,
+        top_rule,
         row(split(" " * title_left + title, status), status_color),
         framed(" " * star_left + star_link + " " * (star_space - star_left)),
         row(labels, "dim"),
@@ -926,7 +1203,7 @@ def screen(radio, columns, rows, now=None):
     ]
 
     presets = list(range(len(radio.local_tracks))) if local else radio.preset_indices()
-    visible = min(len(presets), rows - height - 15)
+    visible = min(len(presets), rows - height - 16)
     selected = radio.local_index if local else radio.selected
     focus = presets.index(selected) if presets else 0
     start = min(max(0, focus - visible + 1), len(presets) - visible)
@@ -942,17 +1219,19 @@ def screen(radio, columns, rows, now=None):
     if not presets:
         lines.append(row("No favorites. Press Tab, then F to add one.", "warning"))
 
-    shortcut = f"1-{len(radio.stations)} Tune" if len(radio.stations) > 1 else "1 Tune"
+    shortcut = f"1-{min(9, len(radio.stations))} Tune" if len(radio.stations) > 1 else "1 Tune"
     tab_action = "TAB All" if radio.favorites_only else "TAB Favorites"
     lines.extend([
         row("N/P Next/prev | ENTER Play | SPACE Play/stop" if local
             else "UP/DOWN Browse | ENTER Tune | SPACE Play/stop", "dim"),
-        row(f"{shortcut} | +/- Volume | M Mute | Q Quit", "dim"),
+        row(f"{shortcut} | Left/Right Vol | M Mute | Q Quit", "dim"),
         row("V View | X Full | H History | L Radio | O Dir" if local
             else "V View | X Full | H History | L Local | O Dir", "dim"),
     ])
     appearance = f"T {radio.theme} | A {'On' if radio.header_motion else 'Off'}"
     lines.append(row(appearance if local else f"F Fav | {tab_action} | {appearance}", "dim"))
+    waterfall_help = "Waterfall" if inner >= 48 else "Fall"
+    lines.append(row(f"/ Find | S Save | B Songs | W {waterfall_help} | Z Sleep", "dim"))
     lines.append(rule)
     return "\r\n".join(lines)
 
@@ -985,7 +1264,7 @@ def terminal():
             key = msvcrt.getwch()
             if key in ("\x00", "\xe0"):
                 return {"H": "up", "P": "down", "K": "left", "M": "right"}.get(msvcrt.getwch(), "")
-            return key.lower()
+            return key
 
         def restore():
             kernel.SetConsoleMode(handle, mode.value)
@@ -997,17 +1276,18 @@ def terminal():
         descriptor = sys.stdin.fileno()
         mode = termios.tcgetattr(descriptor)
         tty.setcbreak(descriptor)
+        text_input = codecs.getincrementaldecoder("utf-8")(errors="ignore")
 
         def read_key():
             if not select.select([descriptor], [], [], 0.06)[0]:
                 return ""
-            key = os.read(descriptor, 1).decode("ascii", errors="ignore")
+            key = text_input.decode(os.read(descriptor, 1))
             if key == "\x1b" and select.select([descriptor], [], [], 0.02)[0]:
                 prefix = os.read(descriptor, 1)
                 if prefix in (b"[", b"O") and select.select([descriptor], [], [], 0.02)[0]:
                     return arrows.get(os.read(descriptor, 1).decode("ascii", errors="ignore"), "")
                 return ""
-            return key.lower()
+            return key
 
         def restore():
             termios.tcsetattr(descriptor, termios.TCSADRAIN, mode)
@@ -1026,7 +1306,8 @@ def check_setup(stations):
     print(f"Python {sys.version.split()[0]}")
     print(f"Station presets: {len(stations)}")
     issues = 0
-    for name in ("ffmpeg", "ffplay"):
+    tools = ("ffmpeg",) if os.name == "nt" else ("ffmpeg", "ffplay")
+    for name in tools:
         try:
             command = find_executable(name)
             result = subprocess.run([command, "-version"], capture_output=True, timeout=5, check=True)
@@ -1036,13 +1317,26 @@ def check_setup(stations):
         else:
             output = result.stdout.decode("utf-8", errors="replace").splitlines()
             print(output[0] if output else f"{name}: available")
+    if os.name == "nt":
+        try:
+            WindowsAudio(SAMPLE_RATE, BLOCK_BYTES).close()
+        except OSError as error:
+            print(f"Windows audio: {error}", file=sys.stderr)
+            issues += 1
+        else:
+            print("Windows audio: ready")
     if issues == 0:
         print("Ready. Run with --demo to check audio and controls.")
     return int(issues > 0)
 
 
+def handle_hangup(_number, _frame):
+    raise KeyboardInterrupt
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=f"Night Signal {VERSION}")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--list", action="store_true", help="print the station presets and exit")
     mode.add_argument("--demo", action="store_true", help="play an offline test signal")
@@ -1054,6 +1348,7 @@ def main():
         if args.check:
             return check_setup(stations)
         if args.list:
+            stations.extend(custom_presets(read_settings(SETTINGS).get("custom_presets"), stations))
             for index, station in enumerate(stations, 1):
                 print(f"{index:02}  {station.name:<16}  {station.genre}")
             return 0
@@ -1061,8 +1356,12 @@ def main():
             raise OSError("Open an interactive terminal to play Night Signal.")
 
         tracks = local_sources(args.play) if args.play else []
-        radio = Radio(stations, find_executable("ffmpeg"), find_executable("ffplay"),
+        player = None if os.name == "nt" else find_executable("ffplay")
+        radio = Radio(stations, find_executable("ffmpeg"), player,
                       settings_path=None if args.demo else SETTINGS)
+        previous_hangup = None
+        if os.name != "nt":
+            previous_hangup = signal.signal(signal.SIGHUP, handle_hangup)
         try:
             with terminal() as read_key:
                 if args.demo:
@@ -1081,12 +1380,16 @@ def main():
                         print(frame_output(frame), end="", flush=True)
                         last_frame = frame
                     key = read_key()
-                    if key in ("q", "\x03"):
+                    if key == "\x03" or (key.lower() == "q" and not radio.typing_station_query()):
                         break
                     if key:
                         radio.handle_key(key)
         finally:
-            radio.stop()
+            try:
+                radio.stop()
+            finally:
+                if previous_hangup is not None:
+                    signal.signal(signal.SIGHUP, previous_hangup)
     except KeyboardInterrupt:
         return 0
     except (OSError, ValueError) as error:
